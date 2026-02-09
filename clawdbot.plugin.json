@@ -1,0 +1,37 @@
+{
+  "id": "billing-tracker",
+  "name": "Billing Tracker",
+  "version": "0.1.0",
+  "description": "Tracks token usage per user/agent for billing and monetization",
+  "author": "Federico Botti",
+  "homepage": "https://github.com/clawdbot/clawdbot",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": {
+        "type": "boolean",
+        "default": true
+      },
+      "dbPath": {
+        "type": "string",
+        "description": "Path to SQLite database file"
+      },
+      "watchIntervalMs": {
+        "type": "number",
+        "default": 5000,
+        "description": "Fallback polling interval if fs.watch fails"
+      },
+      "agents": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Agent IDs to track (empty = all agents)"
+      }
+    }
+  },
+  "uiHints": {
+    "enabled": { "label": "Enable Billing Tracker" },
+    "dbPath": { "label": "Database Path", "placeholder": "~/.clawdbot/billing.db" },
+    "agents": { "label": "Tracked Agents" }
+  }
+}
