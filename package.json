@@ -1,16 +1,18 @@
 {
   "name": "billing-tracker",
-  "version": "0.1.0",
-  "description": "Clawdbot plugin for tracking token usage per user/agent",
+  "version": "0.2.0",
+  "description": "Clawdbot plugin for tracking token usage per user/agent (PostgreSQL)",
   "type": "module",
   "main": "index.ts",
   "clawdbot": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
   "dependencies": {
-    "better-sqlite3": "^11.0.0"
+    "pg": "^8.18.0"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.8"
+    "@types/pg": "^8.15.4"
   }
 }

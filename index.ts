@@ -1,14 +1,17 @@
 /**
- * Billing Tracker Plugin for Clawdbot
+ * Billing Tracker Plugin for Clawdbot (PostgreSQL Version)
  * 
  * Tracks token usage per user/agent by watching session JSONL files.
- * Stores usage data in SQLite for billing/monetization purposes.
+ * Stores usage data in PostgreSQL (Neon) for billing/monetization purposes.
  */
 
 import { watch, FSWatcher } from "fs";
 import { readFile, readdir, stat } from "fs/promises";
 import { join, basename } from "path";
 import { homedir } from "os";
+import pg from "pg";
+
+const { Pool } = pg;
 
 // Types
 interface PluginApi {
@@ -38,7 +41,8 @@ interface PluginApi {
 
 interface PluginConfig {
   enabled?: boolean;
-  dbPath?: string;
+  databaseUrl?: string;
+  botId?: string;
   watchIntervalMs?: number;
   agents?: string[];
 }
@@ -48,12 +52,14 @@ interface UsageRecord {
   agentId: string;
   sessionKey: string;
   userId: string;
+  channel: string;
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
   cacheWriteTokens: number;
   model: string;
   provider: string;
+  costUsd: number;
 }
 
 interface SessionEntry {
@@ -67,116 +73,206 @@ interface SessionEntry {
   model?: string;
 }
 
-// Database helper (using better-sqlite3)
-let db: ReturnType<typeof import("better-sqlite3")> | null = null;
+// Pricing (per million tokens)
+const PRICING: Record<string, { input: number; output: number; cacheRead: number }> = {
+  "claude-sonnet-4-20250514": { input: 3, output: 15, cacheRead: 0.3 },
+  "claude-opus-4-20250514": { input: 15, output: 75, cacheRead: 1.5 },
+  "claude-3-5-sonnet-20241022": { input: 3, output: 15, cacheRead: 0.3 },
+  "claude-3-5-haiku-20241022": { input: 0.8, output: 4, cacheRead: 0.08 },
+  "default": { input: 3, output: 15, cacheRead: 0.3 },
+};
 
-function initDatabase(dbPath: string) {
-  // Dynamic import for better-sqlite3
-  const Database = require("better-sqlite3");
-  db = new Database(dbPath);
-  
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS usage_logs (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      timestamp INTEGER NOT NULL,
-      agent_id TEXT NOT NULL,
-      session_key TEXT NOT NULL,
-      user_id TEXT NOT NULL,
-      input_tokens INTEGER DEFAULT 0,
-      output_tokens INTEGER DEFAULT 0,
-      cache_read_tokens INTEGER DEFAULT 0,
-      cache_write_tokens INTEGER DEFAULT 0,
-      model TEXT,
-      provider TEXT,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_usage_user ON usage_logs(user_id);
-    CREATE INDEX IF NOT EXISTS idx_usage_agent ON usage_logs(agent_id);
-    CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage_logs(timestamp);
-
-    CREATE TABLE IF NOT EXISTS user_credits (
-      user_id TEXT PRIMARY KEY,
-      credits INTEGER DEFAULT 0,
-      updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS file_positions (
-      file_path TEXT PRIMARY KEY,
-      byte_position INTEGER DEFAULT 0,
-      updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-  `);
-  
-  return db;
+function calculateCost(model: string, inputTokens: number, outputTokens: number, cacheReadTokens: number): number {
+  const pricing = PRICING[model] ?? PRICING["default"];
+  return (
+    (inputTokens / 1_000_000) * pricing.input +
+    (outputTokens / 1_000_000) * pricing.output +
+    (cacheReadTokens / 1_000_000) * pricing.cacheRead
+  );
 }
 
-function insertUsage(record: UsageRecord) {
-  if (!db) return;
+// Database
+let pool: pg.Pool | null = null;
+let defaultBotId: string = "unknown";
+
+// Map agent IDs to bot IDs (can be configured or default to same)
+const agentToBotMap: Map<string, string> = new Map();
+
+// File positions cache (in-memory to reduce DB calls)
+const filePositions: Map<string, number> = new Map();
+
+async function initDatabase(databaseUrl: string) {
+  pool = new Pool({ 
+    connectionString: databaseUrl,
+    max: 5,
+    idleTimeoutMillis: 30000,
+  });
   
-  const stmt = db.prepare(`
-    INSERT INTO usage_logs (timestamp, agent_id, session_key, user_id, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, model, provider)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
+  // Test connection
+  const client = await pool.connect();
+  client.release();
   
-  stmt.run(
-    record.timestamp,
-    record.agentId,
+  return pool;
+}
+
+async function getOrCreateUser(externalId: string, channel: string, forBotId: string, displayName?: string): Promise<number> {
+  if (!pool) throw new Error("Database not initialized");
+  
+  const result = await pool.query(`
+    INSERT INTO users (external_id, channel, bot_id, display_name)
+    VALUES ($1, $2, $3, $4)
+    ON CONFLICT (external_id, channel, bot_id) 
+    DO UPDATE SET updated_at = NOW(), display_name = COALESCE(EXCLUDED.display_name, users.display_name)
+    RETURNING id
+  `, [externalId, channel, forBotId, displayName]);
+  
+  return result.rows[0].id;
+}
+
+function getBotIdForAgent(agentId: string): string {
+  return agentToBotMap.get(agentId) ?? agentId;
+}
+
+async function insertUsage(record: UsageRecord) {
+  if (!pool) return;
+  
+  // Get bot ID for this agent
+  const recordBotId = getBotIdForAgent(record.agentId);
+  
+  // Get or create user
+  const [externalId, channel] = parseUserId(record.userId);
+  const userId = await getOrCreateUser(externalId, channel, recordBotId);
+  
+  await pool.query(`
+    INSERT INTO usage_logs (user_id, bot_id, session_key, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, model, provider, cost_usd, created_at)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, to_timestamp($11 / 1000.0))
+  `, [
+    userId,
+    recordBotId,
     record.sessionKey,
-    record.userId,
     record.inputTokens,
     record.outputTokens,
     record.cacheReadTokens,
     record.cacheWriteTokens,
     record.model,
-    record.provider
-  );
+    record.provider,
+    record.costUsd,
+    record.timestamp,
+  ]);
 }
 
-function getFilePosition(filePath: string): number {
-  if (!db) return 0;
-  const row = db.prepare("SELECT byte_position FROM file_positions WHERE file_path = ?").get(filePath) as { byte_position: number } | undefined;
-  return row?.byte_position ?? 0;
+function parseUserId(userId: string): [string, string] {
+  // Parse "telegram:1840436008" format
+  const parts = userId.split(":");
+  if (parts.length === 2) {
+    return [parts[1], parts[0]];
+  }
+  return [userId, "unknown"];
 }
 
-function setFilePosition(filePath: string, position: number) {
-  if (!db) return;
-  db.prepare(`
-    INSERT INTO file_positions (file_path, byte_position, updated_at) 
-    VALUES (?, ?, CURRENT_TIMESTAMP)
-    ON CONFLICT(file_path) DO UPDATE SET byte_position = ?, updated_at = CURRENT_TIMESTAMP
-  `).run(filePath, position, position);
-}
-
-function getUserUsage(userId: string): { total_input: number; total_output: number; total_requests: number } {
-  if (!db) return { total_input: 0, total_output: 0, total_requests: 0 };
+async function getFilePosition(filePath: string): Promise<number> {
+  // Check cache first
+  if (filePositions.has(filePath)) {
+    return filePositions.get(filePath)!;
+  }
   
-  const row = db.prepare(`
+  if (!pool) return 0;
+  
+  try {
+    const result = await pool.query(
+      "SELECT byte_position FROM file_positions WHERE file_path = $1",
+      [filePath]
+    );
+    const position = result.rows[0]?.byte_position ?? 0;
+    filePositions.set(filePath, position);
+    return position;
+  } catch {
+    return 0;
+  }
+}
+
+async function setFilePosition(filePath: string, position: number) {
+  filePositions.set(filePath, position);
+  
+  if (!pool) return;
+  
+  await pool.query(`
+    INSERT INTO file_positions (file_path, byte_position, updated_at)
+    VALUES ($1, $2, NOW())
+    ON CONFLICT (file_path) DO UPDATE SET byte_position = $2, updated_at = NOW()
+  `, [filePath, position]);
+}
+
+async function getUserUsage(externalId: string, forBotId?: string): Promise<{ total_input: number; total_output: number; total_requests: number; total_cost: number }> {
+  if (!pool) return { total_input: 0, total_output: 0, total_requests: 0, total_cost: 0 };
+  
+  let query: string;
+  let params: string[];
+  
+  if (forBotId) {
+    query = `
+      SELECT 
+        COALESCE(SUM(ul.input_tokens), 0)::int as total_input,
+        COALESCE(SUM(ul.output_tokens), 0)::int as total_output,
+        COUNT(*)::int as total_requests,
+        COALESCE(SUM(ul.cost_usd), 0)::float as total_cost
+      FROM usage_logs ul
+      JOIN users u ON ul.user_id = u.id
+      WHERE u.external_id = $1 AND ul.bot_id = $2
+    `;
+    params = [externalId, forBotId];
+  } else {
+    // All bots
+    query = `
+      SELECT 
+        COALESCE(SUM(ul.input_tokens), 0)::int as total_input,
+        COALESCE(SUM(ul.output_tokens), 0)::int as total_output,
+        COUNT(*)::int as total_requests,
+        COALESCE(SUM(ul.cost_usd), 0)::float as total_cost
+      FROM usage_logs ul
+      JOIN users u ON ul.user_id = u.id
+      WHERE u.external_id = $1
+    `;
+    params = [externalId];
+  }
+  
+  const result = await pool.query(query, params);
+  return result.rows[0];
+}
+
+async function getBotUsage(forBotId: string): Promise<{ total_input: number; total_output: number; total_requests: number; unique_users: number; total_cost: number }> {
+  if (!pool) return { total_input: 0, total_output: 0, total_requests: 0, unique_users: 0, total_cost: 0 };
+  
+  const result = await pool.query(`
     SELECT 
-      COALESCE(SUM(input_tokens), 0) as total_input,
-      COALESCE(SUM(output_tokens), 0) as total_output,
-      COUNT(*) as total_requests
+      COALESCE(SUM(input_tokens), 0)::int as total_input,
+      COALESCE(SUM(output_tokens), 0)::int as total_output,
+      COUNT(*)::int as total_requests,
+      COUNT(DISTINCT user_id)::int as unique_users,
+      COALESCE(SUM(cost_usd), 0)::float as total_cost
     FROM usage_logs 
-    WHERE user_id = ?
-  `).get(userId) as { total_input: number; total_output: number; total_requests: number };
+    WHERE bot_id = $1
+  `, [forBotId]);
   
-  return row;
+  return result.rows[0];
 }
 
-function getAgentUsage(agentId: string): { total_input: number; total_output: number; total_requests: number; unique_users: number } {
-  if (!db) return { total_input: 0, total_output: 0, total_requests: 0, unique_users: 0 };
+async function getAllBotsUsage(): Promise<Array<{ bot_id: string; total_input: number; total_output: number; total_requests: number; unique_users: number; total_cost: number }>> {
+  if (!pool) return [];
   
-  const row = db.prepare(`
+  const result = await pool.query(`
     SELECT 
-      COALESCE(SUM(input_tokens), 0) as total_input,
-      COALESCE(SUM(output_tokens), 0) as total_output,
-      COUNT(*) as total_requests,
-      COUNT(DISTINCT user_id) as unique_users
+      bot_id,
+      COALESCE(SUM(input_tokens), 0)::int as total_input,
+      COALESCE(SUM(output_tokens), 0)::int as total_output,
+      COUNT(*)::int as total_requests,
+      COUNT(DISTINCT user_id)::int as unique_users,
+      COALESCE(SUM(cost_usd), 0)::float as total_cost
     FROM usage_logs 
-    WHERE agent_id = ?
-  `).get(agentId) as { total_input: number; total_output: number; total_requests: number; unique_users: number };
+    GROUP BY bot_id
+  `);
   
-  return row;
+  return result.rows;
 }
 
 // Session file watcher
@@ -193,13 +289,13 @@ class SessionWatcher {
   }
   
   async start() {
-    this.logger.info("[billing-tracker] Starting session watcher...");
+    this.logger.info(`[billing-tracker] Starting session watcher for agents: ${this.trackedAgents.length > 0 ? this.trackedAgents.join(", ") : "all"}`);
     await this.scanAgents();
   }
   
   async stop() {
     this.logger.info("[billing-tracker] Stopping session watcher...");
-    for (const [path, watcher] of this.watchers) {
+    for (const [, watcher] of this.watchers) {
       watcher.close();
     }
     this.watchers.clear();
@@ -267,14 +363,14 @@ class SessionWatcher {
   private async processSessionFile(agentId: string, filePath: string) {
     try {
       const content = await readFile(filePath, "utf-8");
-      const lastPosition = getFilePosition(filePath);
+      const lastPosition = await getFilePosition(filePath);
       
       // Only process new content
       const newContent = content.slice(lastPosition);
       if (!newContent.trim()) return;
       
       const lines = newContent.split("\n").filter(line => line.trim());
-      let processedAny = false;
+      let processedCount = 0;
       
       for (const line of lines) {
         try {
@@ -284,23 +380,30 @@ class SessionWatcher {
           if (entry.role === "assistant" && entry.usage) {
             const sessionKey = basename(filePath, ".jsonl");
             
-            // Extract user ID from session metadata (we'll need to read sessions.json)
+            // Extract user ID from session metadata
             const userId = await this.getUserIdForSession(agentId, sessionKey);
             
             if (userId) {
-              insertUsage({
+              const inputTokens = entry.usage.input_tokens ?? 0;
+              const outputTokens = entry.usage.output_tokens ?? 0;
+              const cacheReadTokens = entry.usage.cache_read_input_tokens ?? 0;
+              const model = entry.model ?? "unknown";
+              
+              await insertUsage({
                 timestamp: Date.now(),
                 agentId,
                 sessionKey,
                 userId,
-                inputTokens: entry.usage.input_tokens ?? 0,
-                outputTokens: entry.usage.output_tokens ?? 0,
-                cacheReadTokens: entry.usage.cache_read_input_tokens ?? 0,
+                channel: userId.split(":")[0] ?? "unknown",
+                inputTokens,
+                outputTokens,
+                cacheReadTokens,
                 cacheWriteTokens: entry.usage.cache_creation_input_tokens ?? 0,
-                model: entry.model ?? "unknown",
-                provider: "anthropic", // TODO: extract from model
+                model,
+                provider: "anthropic",
+                costUsd: calculateCost(model, inputTokens, outputTokens, cacheReadTokens),
               });
-              processedAny = true;
+              processedCount++;
             }
           }
         } catch {
@@ -309,12 +412,12 @@ class SessionWatcher {
       }
       
       // Update file position
-      setFilePosition(filePath, content.length);
+      await setFilePosition(filePath, content.length);
       
-      if (processedAny) {
-        this.logger.info(`[billing-tracker] Processed usage from ${agentId}`);
+      if (processedCount > 0) {
+        this.logger.info(`[billing-tracker] Processed ${processedCount} usage records from ${agentId}`);
       }
-    } catch (err) {
+    } catch {
       // File might not exist yet
     }
   }
@@ -326,10 +429,9 @@ class SessionWatcher {
       const sessions = JSON.parse(content);
       
       // Find session by ID
-      for (const [key, session] of Object.entries(sessions)) {
+      for (const [, session] of Object.entries(sessions)) {
         const s = session as { sessionId?: string; origin?: { from?: string } };
         if (s.sessionId === sessionId && s.origin?.from) {
-          // Extract user ID from origin.from (e.g., "telegram:1840436008")
           return s.origin.from;
         }
       }
@@ -338,6 +440,19 @@ class SessionWatcher {
     }
     return null;
   }
+}
+
+// Ensure file_positions table exists
+async function ensureFilePositionsTable() {
+  if (!pool) return;
+  
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS file_positions (
+      file_path TEXT PRIMARY KEY,
+      byte_position INTEGER DEFAULT 0,
+      updated_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
 }
 
 // Main plugin export
@@ -350,58 +465,100 @@ export default function billingTrackerPlugin(api: PluginApi) {
     return;
   }
   
-  const dbPath = config.dbPath ?? join(homedir(), ".clawdbot", "billing.db");
-  const trackedAgents = config.agents ?? [];
+  // Try multiple sources for database URL
+  let databaseUrl = config.databaseUrl ?? process.env.BILLING_DATABASE_URL;
   
-  let watcher: SessionWatcher | null = null;
+  // Fallback: read from .env file
+  if (!databaseUrl) {
+    try {
+      const envPath = join(homedir(), ".clawdbot", ".env");
+      const envContent = require("fs").readFileSync(envPath, "utf-8");
+      const match = envContent.match(/BILLING_DATABASE_URL=(.+)/);
+      if (match) {
+        databaseUrl = match[1].trim();
+      }
+    } catch {}
+  }
   
-  // Initialize database
-  try {
-    initDatabase(dbPath);
-    api.logger.info(`[billing-tracker] Database initialized at ${dbPath}`);
-  } catch (err) {
-    api.logger.error(`[billing-tracker] Failed to init database: ${err}`);
+  if (!databaseUrl) {
+    api.logger.error("[billing-tracker] No databaseUrl configured. Set BILLING_DATABASE_URL in ~/.clawdbot/.env");
     return;
   }
+  
+  defaultBotId = config.botId ?? "unknown";
+  const trackedAgents = config.agents ?? [];
+  
+  // Set up agent to bot mapping (default: agent ID = bot ID)
+  for (const agent of trackedAgents) {
+    agentToBotMap.set(agent, agent);
+  }
+  
+  let watcher: SessionWatcher | null = null;
   
   // Register background service
   api.registerService({
     id: "billing-tracker",
     start: async () => {
-      watcher = new SessionWatcher(api.logger, trackedAgents);
-      await watcher.start();
+      try {
+        await initDatabase(databaseUrl);
+        await ensureFilePositionsTable();
+        api.logger.info(`[billing-tracker] Connected to PostgreSQL (bot: ${botId})`);
+        
+        watcher = new SessionWatcher(api.logger, trackedAgents);
+        await watcher.start();
+      } catch (err) {
+        api.logger.error(`[billing-tracker] Failed to start: ${err}`);
+      }
     },
     stop: async () => {
       if (watcher) {
         await watcher.stop();
         watcher = null;
       }
-      if (db) {
-        db.close();
-        db = null;
+      if (pool) {
+        await pool.end();
+        pool = null;
       }
     },
   });
   
   // Register RPC methods
-  api.registerGatewayMethod("billing.user_usage", ({ params, respond }) => {
+  api.registerGatewayMethod("billing.user_usage", async ({ params, respond }) => {
     const userId = params.userId as string;
+    const forBotId = params.botId as string | undefined;
     if (!userId) {
       respond(false, { error: "userId required" });
       return;
     }
-    const usage = getUserUsage(userId);
-    respond(true, usage);
+    try {
+      const usage = await getUserUsage(userId, forBotId);
+      respond(true, usage);
+    } catch (err) {
+      respond(false, { error: String(err) });
+    }
   });
   
-  api.registerGatewayMethod("billing.agent_usage", ({ params, respond }) => {
-    const agentId = params.agentId as string;
-    if (!agentId) {
-      respond(false, { error: "agentId required" });
+  api.registerGatewayMethod("billing.bot_usage", async ({ params, respond }) => {
+    const forBotId = params.botId as string;
+    if (!forBotId) {
+      respond(false, { error: "botId required" });
       return;
     }
-    const usage = getAgentUsage(agentId);
-    respond(true, usage);
+    try {
+      const usage = await getBotUsage(forBotId);
+      respond(true, usage);
+    } catch (err) {
+      respond(false, { error: String(err) });
+    }
+  });
+  
+  api.registerGatewayMethod("billing.all_bots_usage", async ({ params, respond }) => {
+    try {
+      const usage = await getAllBotsUsage();
+      respond(true, usage);
+    } catch (err) {
+      respond(false, { error: String(err) });
+    }
   });
   
   // Register chat commands
@@ -409,23 +566,107 @@ export default function billingTrackerPlugin(api: PluginApi) {
     name: "consumo",
     description: "Ver tu consumo de tokens",
     handler: async (ctx) => {
-      const userId = ctx.senderId;
-      if (!userId) {
+      const senderId = ctx.senderId;
+      if (!senderId) {
         return { text: "❌ No pude identificar tu usuario" };
       }
       
-      const usage = getUserUsage(userId);
-      const totalTokens = usage.total_input + usage.total_output;
+      // Parse sender ID (e.g., "telegram:1840436008" -> "1840436008")
+      const [externalId] = parseUserId(senderId);
       
-      return {
-        text: `📊 **Tu consumo:**\n\n` +
-          `• Requests: ${usage.total_requests}\n` +
-          `• Input tokens: ${usage.total_input.toLocaleString()}\n` +
-          `• Output tokens: ${usage.total_output.toLocaleString()}\n` +
-          `• **Total: ${totalTokens.toLocaleString()} tokens**`
-      };
+      try {
+        // Get usage across all bots for this user
+        const usage = await getUserUsage(externalId);
+        const totalTokens = usage.total_input + usage.total_output;
+        
+        if (usage.total_requests === 0) {
+          return { text: "📊 No hay consumo registrado aún." };
+        }
+        
+        return {
+          text: `📊 **Tu consumo:**\n\n` +
+            `• Requests: ${usage.total_requests}\n` +
+            `• Input tokens: ${usage.total_input.toLocaleString()}\n` +
+            `• Output tokens: ${usage.total_output.toLocaleString()}\n` +
+            `• **Total: ${totalTokens.toLocaleString()} tokens**\n` +
+            `• 💵 Costo: $${usage.total_cost.toFixed(4)} USD`
+        };
+      } catch (err) {
+        return { text: `❌ Error: ${err}` };
+      }
     },
   });
   
-  api.logger.info("[billing-tracker] Plugin loaded");
+  // Add more API methods for dashboard
+  api.registerGatewayMethod("billing.all_users", async ({ params, respond }) => {
+    if (!pool) {
+      respond(false, { error: "Database not connected" });
+      return;
+    }
+    try {
+      const result = await pool.query(`
+        SELECT 
+          u.id, u.external_id, u.channel, u.bot_id, u.display_name, u.enabled, u.created_at,
+          COALESCE(SUM(ul.input_tokens + ul.output_tokens), 0)::int as total_tokens,
+          COALESCE(SUM(ul.cost_usd), 0)::float as total_cost,
+          COUNT(ul.id)::int as total_requests
+        FROM users u
+        LEFT JOIN usage_logs ul ON u.id = ul.user_id
+        GROUP BY u.id
+        ORDER BY total_tokens DESC
+      `);
+      respond(true, result.rows);
+    } catch (err) {
+      respond(false, { error: String(err) });
+    }
+  });
+  
+  api.registerGatewayMethod("billing.all_bots", async ({ params, respond }) => {
+    if (!pool) {
+      respond(false, { error: "Database not connected" });
+      return;
+    }
+    try {
+      const result = await pool.query(`
+        SELECT 
+          b.id, b.bot_id, b.name, b.description, b.enabled, b.created_at,
+          COALESCE(SUM(ul.input_tokens), 0)::int as total_input,
+          COALESCE(SUM(ul.output_tokens), 0)::int as total_output,
+          COALESCE(SUM(ul.cost_usd), 0)::float as total_cost,
+          COUNT(DISTINCT ul.user_id)::int as unique_users
+        FROM bots b
+        LEFT JOIN usage_logs ul ON b.bot_id = ul.bot_id
+        GROUP BY b.id
+        ORDER BY b.bot_id
+      `);
+      respond(true, result.rows);
+    } catch (err) {
+      respond(false, { error: String(err) });
+    }
+  });
+  
+  api.registerGatewayMethod("billing.recent_usage", async ({ params, respond }) => {
+    if (!pool) {
+      respond(false, { error: "Database not connected" });
+      return;
+    }
+    const limit = (params.limit as number) || 100;
+    try {
+      const result = await pool.query(`
+        SELECT 
+          ul.id, ul.bot_id, ul.session_key, ul.input_tokens, ul.output_tokens, 
+          ul.cache_read_tokens, ul.model, ul.provider, ul.cost_usd, ul.created_at,
+          u.external_id, u.channel, u.display_name
+        FROM usage_logs ul
+        JOIN users u ON ul.user_id = u.id
+        ORDER BY ul.created_at DESC
+        LIMIT $1
+      `, [limit]);
+      respond(true, result.rows);
+    } catch (err) {
+      respond(false, { error: String(err) });
+    }
+  });
+  
+  api.logger.info("[billing-tracker] Plugin loaded (PostgreSQL mode)");
 }
