@@ -63,8 +63,29 @@ interface UsageRecord {
 }
 
 interface SessionEntry {
+  type?: string;
+  message?: {
+    role?: string;
+    usage?: {
+      input?: number;
+      output?: number;
+      cacheRead?: number;
+      cacheWrite?: number;
+      // Alternative formats
+      input_tokens?: number;
+      output_tokens?: number;
+      cache_read_input_tokens?: number;
+      cache_creation_input_tokens?: number;
+    };
+    model?: string;
+  };
+  // Legacy flat format
   role?: string;
   usage?: {
+    input?: number;
+    output?: number;
+    cacheRead?: number;
+    cacheWrite?: number;
     input_tokens?: number;
     output_tokens?: number;
     cache_read_input_tokens?: number;
@@ -115,33 +136,63 @@ async function initDatabase(databaseUrl: string) {
   return pool;
 }
 
-async function getOrCreateUser(externalId: string, channel: string, forBotId: string, displayName?: string): Promise<number> {
+interface UserInfo {
+  externalId: string;
+  channel: string;
+  displayName?: string;
+  username?: string;
+  firstName?: string;
+  lastName?: string;
+}
+
+async function getOrCreateUser(userInfo: UserInfo, forBotId: string): Promise<number> {
   if (!pool) throw new Error("Database not initialized");
   
   const result = await pool.query(`
-    INSERT INTO users (external_id, channel, bot_id, display_name)
-    VALUES ($1, $2, $3, $4)
+    INSERT INTO users (external_id, channel, bot_id, display_name, username, first_name, last_name)
+    VALUES ($1, $2, $3, $4, $5, $6, $7)
     ON CONFLICT (external_id, channel, bot_id) 
-    DO UPDATE SET updated_at = NOW(), display_name = COALESCE(EXCLUDED.display_name, users.display_name)
+    DO UPDATE SET 
+      updated_at = NOW(), 
+      display_name = COALESCE(EXCLUDED.display_name, users.display_name),
+      username = COALESCE(EXCLUDED.username, users.username),
+      first_name = COALESCE(EXCLUDED.first_name, users.first_name),
+      last_name = COALESCE(EXCLUDED.last_name, users.last_name)
     RETURNING id
-  `, [externalId, channel, forBotId, displayName]);
+  `, [userInfo.externalId, userInfo.channel, forBotId, userInfo.displayName, userInfo.username, userInfo.firstName, userInfo.lastName]);
   
   return result.rows[0].id;
+}
+
+// Parse user label like "F B (@dinjarin5) id:1840436008" or "Gonza Lopez (@gonza18lopez) id:1301157295"
+function parseUserLabel(label: string): { displayName?: string; username?: string } {
+  const usernameMatch = label.match(/@(\w+)/);
+  const nameMatch = label.match(/^([^(@]+)/);
+  
+  return {
+    displayName: nameMatch ? nameMatch[1].trim() : undefined,
+    username: usernameMatch ? usernameMatch[1] : undefined,
+  };
 }
 
 function getBotIdForAgent(agentId: string): string {
   return agentToBotMap.get(agentId) ?? agentId;
 }
 
-async function insertUsage(record: UsageRecord) {
+async function insertUsage(record: UsageRecord, userInfo?: UserInfo) {
   if (!pool) return;
   
   // Get bot ID for this agent
   const recordBotId = getBotIdForAgent(record.agentId);
   
   // Get or create user
-  const [externalId, channel] = parseUserId(record.userId);
-  const userId = await getOrCreateUser(externalId, channel, recordBotId);
+  let userId: number;
+  if (userInfo) {
+    userId = await getOrCreateUser(userInfo, recordBotId);
+  } else {
+    const [externalId, channel] = parseUserId(record.userId);
+    userId = await getOrCreateUser({ externalId, channel }, recordBotId);
+  }
   
   await pool.query(`
     INSERT INTO usage_logs (user_id, bot_id, session_key, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, model, provider, cost_usd, created_at)
@@ -376,33 +427,41 @@ class SessionWatcher {
         try {
           const entry = JSON.parse(line) as SessionEntry;
           
+          // Handle nested message format (type: "message") or flat format
+          const msg = entry.message ?? entry;
+          const role = msg.role;
+          const usage = msg.usage;
+          const model = msg.model;
+          
           // Only process assistant messages with usage
-          if (entry.role === "assistant" && entry.usage) {
+          if (role === "assistant" && usage) {
             const sessionKey = basename(filePath, ".jsonl");
             
-            // Extract user ID from session metadata
-            const userId = await this.getUserIdForSession(agentId, sessionKey);
+            // Extract user info from session metadata
+            const userInfo = await this.getUserInfoForSession(agentId, sessionKey);
             
-            if (userId) {
-              const inputTokens = entry.usage.input_tokens ?? 0;
-              const outputTokens = entry.usage.output_tokens ?? 0;
-              const cacheReadTokens = entry.usage.cache_read_input_tokens ?? 0;
-              const model = entry.model ?? "unknown";
+            if (userInfo) {
+              // Handle both field naming conventions
+              const inputTokens = usage.input ?? usage.input_tokens ?? 0;
+              const outputTokens = usage.output ?? usage.output_tokens ?? 0;
+              const cacheReadTokens = usage.cacheRead ?? usage.cache_read_input_tokens ?? 0;
+              const cacheWriteTokens = usage.cacheWrite ?? usage.cache_creation_input_tokens ?? 0;
+              const modelName = model ?? "unknown";
               
               await insertUsage({
                 timestamp: Date.now(),
                 agentId,
                 sessionKey,
-                userId,
-                channel: userId.split(":")[0] ?? "unknown",
+                userId: `${userInfo.channel}:${userInfo.externalId}`,
+                channel: userInfo.channel,
                 inputTokens,
                 outputTokens,
                 cacheReadTokens,
-                cacheWriteTokens: entry.usage.cache_creation_input_tokens ?? 0,
-                model,
+                cacheWriteTokens,
+                model: modelName,
                 provider: "anthropic",
-                costUsd: calculateCost(model, inputTokens, outputTokens, cacheReadTokens),
-              });
+                costUsd: calculateCost(modelName, inputTokens, outputTokens, cacheReadTokens),
+              }, userInfo);
               processedCount++;
             }
           }
@@ -422,7 +481,7 @@ class SessionWatcher {
     }
   }
   
-  private async getUserIdForSession(agentId: string, sessionId: string): Promise<string | null> {
+  private async getUserInfoForSession(agentId: string, sessionId: string): Promise<UserInfo | null> {
     try {
       const sessionsJsonPath = join(this.agentsDir, agentId, "sessions", "sessions.json");
       const content = await readFile(sessionsJsonPath, "utf-8");
@@ -430,9 +489,20 @@ class SessionWatcher {
       
       // Find session by ID
       for (const [, session] of Object.entries(sessions)) {
-        const s = session as { sessionId?: string; origin?: { from?: string } };
+        const s = session as { 
+          sessionId?: string; 
+          origin?: { from?: string; label?: string } 
+        };
         if (s.sessionId === sessionId && s.origin?.from) {
-          return s.origin.from;
+          const [externalId, channel] = parseUserId(s.origin.from);
+          const labelInfo = s.origin.label ? parseUserLabel(s.origin.label) : {};
+          
+          return {
+            externalId,
+            channel,
+            displayName: labelInfo.displayName,
+            username: labelInfo.username,
+          };
         }
       }
     } catch {
@@ -495,17 +565,23 @@ export default function billingTrackerPlugin(api: PluginApi) {
   
   let watcher: SessionWatcher | null = null;
   
+  api.logger.info(`[billing-tracker] Registering service with DB URL: ${databaseUrl ? 'found' : 'missing'}`);
+  
   // Register background service
   api.registerService({
     id: "billing-tracker",
     start: async () => {
+      api.logger.info(`[billing-tracker] Service start() called`);
       try {
+        api.logger.info(`[billing-tracker] Connecting to database...`);
         await initDatabase(databaseUrl);
         await ensureFilePositionsTable();
-        api.logger.info(`[billing-tracker] Connected to PostgreSQL (bot: ${botId})`);
+        api.logger.info(`[billing-tracker] Connected to PostgreSQL`);
         
+        api.logger.info(`[billing-tracker] Starting session watcher for ${trackedAgents.length || 'all'} agents`);
         watcher = new SessionWatcher(api.logger, trackedAgents);
         await watcher.start();
+        api.logger.info(`[billing-tracker] Session watcher started`);
       } catch (err) {
         api.logger.error(`[billing-tracker] Failed to start: ${err}`);
       }

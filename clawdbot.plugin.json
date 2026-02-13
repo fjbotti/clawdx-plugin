@@ -1,10 +1,10 @@
 {
   "id": "billing-tracker",
   "name": "Billing Tracker",
-  "version": "0.1.0",
-  "description": "Tracks token usage per user/agent for billing and monetization",
+  "version": "0.2.0",
+  "description": "Tracks token usage per user/agent for billing and monetization (PostgreSQL)",
   "author": "Federico Botti",
-  "homepage": "https://github.com/clawdbot/clawdbot",
+  "homepage": "https://github.com/fjbotti/clawdbot-billing-tracker",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -13,14 +13,13 @@
         "type": "boolean",
         "default": true
       },
-      "dbPath": {
+      "databaseUrl": {
         "type": "string",
-        "description": "Path to SQLite database file"
+        "description": "PostgreSQL connection URL (or set BILLING_DATABASE_URL env var)"
       },
-      "watchIntervalMs": {
-        "type": "number",
-        "default": 5000,
-        "description": "Fallback polling interval if fs.watch fails"
+      "botId": {
+        "type": "string",
+        "description": "Bot identifier for multi-bot setups"
       },
       "agents": {
         "type": "array",
@@ -31,7 +30,7 @@
   },
   "uiHints": {
     "enabled": { "label": "Enable Billing Tracker" },
-    "dbPath": { "label": "Database Path", "placeholder": "~/.clawdbot/billing.db" },
+    "databaseUrl": { "label": "Database URL", "placeholder": "postgresql://..." },
     "agents": { "label": "Tracked Agents" }
   }
 }
