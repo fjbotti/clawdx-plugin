@@ -143,35 +143,49 @@ interface UserInfo {
   username?: string;
   firstName?: string;
   lastName?: string;
+  phone?: string;
 }
 
 async function getOrCreateUser(userInfo: UserInfo, forBotId: string): Promise<number> {
   if (!pool) throw new Error("Database not initialized");
   
   const result = await pool.query(`
-    INSERT INTO users (external_id, channel, bot_id, display_name, username, first_name, last_name)
-    VALUES ($1, $2, $3, $4, $5, $6, $7)
+    INSERT INTO users (external_id, channel, bot_id, display_name, username, first_name, last_name, phone)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
     ON CONFLICT (external_id, channel, bot_id) 
     DO UPDATE SET 
       updated_at = NOW(), 
       display_name = COALESCE(EXCLUDED.display_name, users.display_name),
       username = COALESCE(EXCLUDED.username, users.username),
       first_name = COALESCE(EXCLUDED.first_name, users.first_name),
-      last_name = COALESCE(EXCLUDED.last_name, users.last_name)
+      last_name = COALESCE(EXCLUDED.last_name, users.last_name),
+      phone = COALESCE(EXCLUDED.phone, users.phone)
     RETURNING id
-  `, [userInfo.externalId, userInfo.channel, forBotId, userInfo.displayName, userInfo.username, userInfo.firstName, userInfo.lastName]);
+  `, [userInfo.externalId, userInfo.channel, forBotId, userInfo.displayName, userInfo.username, userInfo.firstName, userInfo.lastName, userInfo.phone]);
   
   return result.rows[0].id;
 }
 
 // Parse user label like "F B (@dinjarin5) id:1840436008" or "Gonza Lopez (@gonza18lopez) id:1301157295"
-function parseUserLabel(label: string): { displayName?: string; username?: string } {
+function parseUserLabel(label: string): { displayName?: string; username?: string; firstName?: string; lastName?: string } {
   const usernameMatch = label.match(/@(\w+)/);
   const nameMatch = label.match(/^([^(@]+)/);
+  const displayName = nameMatch ? nameMatch[1].trim() : undefined;
+  
+  // Split display name into first/last
+  let firstName: string | undefined;
+  let lastName: string | undefined;
+  if (displayName) {
+    const parts = displayName.split(/\s+/);
+    firstName = parts[0];
+    lastName = parts.length > 1 ? parts.slice(1).join(' ') : undefined;
+  }
   
   return {
-    displayName: nameMatch ? nameMatch[1].trim() : undefined,
+    displayName,
     username: usernameMatch ? usernameMatch[1] : undefined,
+    firstName,
+    lastName,
   };
 }
 
@@ -497,11 +511,17 @@ class SessionWatcher {
           const [externalId, channel] = parseUserId(s.origin.from);
           const labelInfo = s.origin.label ? parseUserLabel(s.origin.label) : {};
           
+          // For WhatsApp, the external ID is the phone number
+          const phone = channel === 'whatsapp' ? externalId : undefined;
+          
           return {
             externalId,
             channel,
             displayName: labelInfo.displayName,
             username: labelInfo.username,
+            firstName: labelInfo.firstName,
+            lastName: labelInfo.lastName,
+            phone,
           };
         }
       }
