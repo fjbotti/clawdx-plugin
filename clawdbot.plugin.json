@@ -1,10 +1,10 @@
 {
   "id": "billing-tracker",
-  "name": "Billing Tracker",
-  "version": "0.2.0",
-  "description": "Tracks token usage per user/agent for billing and monetization (PostgreSQL)",
-  "author": "Federico Botti",
-  "homepage": "https://github.com/fjbotti/clawdbot-billing-tracker",
+  "name": "ClawdX Plugin",
+  "version": "0.3.0",
+  "description": "ClawdX plugin for Clawdbot — tracks token usage, conversations, and costs per user/agent",
+  "author": "SparkLabs",
+  "homepage": "https://getclawdx.vercel.app",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -13,9 +13,17 @@
         "type": "boolean",
         "default": true
       },
+      "dashboardUrl": {
+        "type": "string",
+        "description": "ClawdX dashboard URL (e.g. https://getclawdx.vercel.app)"
+      },
+      "dashboardApiKey": {
+        "type": "string",
+        "description": "ClawdX API key (starts with sk_)"
+      },
       "databaseUrl": {
         "type": "string",
-        "description": "PostgreSQL connection URL (or set BILLING_DATABASE_URL env var)"
+        "description": "Direct PostgreSQL connection URL (advanced, use dashboardUrl instead)"
       },
       "botId": {
         "type": "string",
@@ -29,8 +37,10 @@
     }
   },
   "uiHints": {
-    "enabled": { "label": "Enable Billing Tracker" },
-    "databaseUrl": { "label": "Database URL", "placeholder": "postgresql://..." },
+    "enabled": { "label": "Enable ClawdX Plugin" },
+    "dashboardUrl": { "label": "Dashboard URL", "placeholder": "https://getclawdx.vercel.app" },
+    "dashboardApiKey": { "label": "API Key", "placeholder": "sk_..." },
+    "databaseUrl": { "label": "Database URL (advanced)", "placeholder": "postgresql://..." },
     "agents": { "label": "Tracked Agents" }
   }
 }
