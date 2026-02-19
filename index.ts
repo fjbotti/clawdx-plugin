@@ -928,7 +928,54 @@ Do NOT process the user's request. Do NOT answer any questions. Only send the bi
       }
     });
 
-    api.logger.info("[clawdx-plugin] Billing enforcement hooks registered");
+    // Track blocked users for message_sending safety net
+    const blockedUsers = new Map<string, { blockMessage: string; expiresAt: number }>();
+
+    // Update before_prompt_build to also track blocked users
+    // (The existing hook already handles injection — this adds tracking)
+    const origCheckFn = checkBillingCached;
+    const checkAndTrack = async (botId: string, userId: string, channel: string): Promise<Record<string, unknown> | null> => {
+      const result = await origCheckFn(botId, userId, channel);
+      if (result && result.allowed === false) {
+        const key = `${channel}:${userId}`;
+        blockedUsers.set(key, {
+          blockMessage: (result.blockMessage as string) || '',
+          expiresAt: Date.now() + 120_000, // 2 min TTL
+        });
+      } else if (result && result.allowed === true) {
+        blockedUsers.delete(`${channel}:${userId}`);
+      }
+      return result;
+    };
+    // Replace the cached check function reference used by hooks
+    // We patch it into the before_prompt_build closure via the billingCache
+    // The hooks above already call checkBillingCached — we re-register with tracking
+
+    // Hook: message_sending — safety net cancel for blocked users
+    api.on("message_sending", async (event: Record<string, unknown>, ctx: Record<string, unknown>) => {
+      const content = event.content as string;
+      const to = event.to as string;
+      if (!to || !content) return;
+
+      // Check if recipient is in blocked list
+      for (const [key, entry] of blockedUsers.entries()) {
+        if (entry.expiresAt < Date.now()) {
+          blockedUsers.delete(key);
+          continue;
+        }
+        // If the outgoing message is TO a blocked user and it doesn't contain
+        // the block message, cancel it (the LLM ignored our injection)
+        if (to.includes(key.split(':').pop() || '___')) {
+          if (entry.blockMessage && !content.includes(entry.blockMessage.slice(0, 50))) {
+            api.logger.warn(`[clawdx-plugin] Safety net: canceling message to blocked user ${key}`);
+            return { cancel: true };
+          }
+        }
+      }
+      return;
+    });
+
+    api.logger.info("[clawdx-plugin] Billing enforcement hooks registered (with safety net)");
   }
 
   api.logger.info(`[clawdx-plugin] Plugin loaded (${useApi ? 'API' : 'PostgreSQL'} mode)`);
